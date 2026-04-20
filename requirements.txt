@@ -1,0 +1,17 @@
+pandas
+openpyxl
+streamlit
+numpy
+openai
+python-dotenv
+chromadb
+sentence-transformers
+tiktoken
+langgraph
+langchain-openai
+fastapi
+uvicorn[standard]
+httpx
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.0.1
