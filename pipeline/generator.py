@@ -1,12 +1,12 @@
 """
 pipeline/generator.py
 ---------------------
-LLM response generation layer.
+NOTE: This module is NOT used by the main pipeline (chain.py → sql_agent.py).
+It was part of an earlier architecture. It is kept here as a utility library
+in case you want to build alternative pipeline branches in future.
 
-Two responsibilities:
-  1. classify()       — Determine which retrieval mode to use for a query.
-  2. generate()       — Generate a natural language answer from retrieved context.
-  3. build_pandas_code() — For filter/aggregate queries, produce safe pandas code.
+If you are not using it, it is safe to delete this file.
+The live pipeline is: chain.py → sql_agent.py → (SQL + ChromaDB).
 """
 
 import pandas as pd
@@ -92,7 +92,7 @@ def _llm(client: OpenAI, system: str, messages: list[dict], temperature: float =
 
 def classify(query: str, client: OpenAI) -> str:
     """Returns one of: "lookup" | "filter" | "aggregate" | "semantic" """
-    category = _llm(client, CLASSIFIER_PROMPT, [{"role": "user", "content": query}], max_tokens=10).lower()
+    category = _llm(client, CLASSIFIER_PROMPT, [{"role": "user", "content": query}], max_tokens=15).lower()
     return category if category in QUERY_TYPES else "semantic"
 
 

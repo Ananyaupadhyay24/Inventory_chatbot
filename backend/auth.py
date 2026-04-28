@@ -20,7 +20,9 @@ from passlib.context import CryptContext
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-SECRET_KEY                   = os.getenv("SECRET_KEY", "change-me-in-production")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY is not set in .env — app cannot start safely.")
 ALGORITHM                    = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS",   "7"))

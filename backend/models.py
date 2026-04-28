@@ -51,9 +51,24 @@ class JoinersRequest(BaseModel):
     new_joiners: int
 
 
+class SmartPredictionRequest(BaseModel):
+    new_joiners: int
+    department:  str       = ""   # e.g. "Engineering", "Design", "QA"
+    categories:  list[str] = []   # e.g. ["Laptop", "Desktop"]
+
+
 class StockSummaryResponse(BaseModel):
     records: list[dict]
     total:   int
+
+
+class SmartPredictionResponse(BaseModel):
+    new_joiners:  int
+    department:   str
+    categories:   list[str]
+    breakdown:    list[dict]
+    reasoning:    str        # LLM: what you need and why
+    advancements: str        # LLM: recommended future improvements
 
 
 class PredictionResponse(BaseModel):

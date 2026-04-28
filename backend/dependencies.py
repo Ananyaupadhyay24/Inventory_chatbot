@@ -9,7 +9,6 @@ Shared FastAPI Depends() providers:
 """
 
 import os
-from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -31,19 +30,45 @@ bearer_scheme = HTTPBearer(auto_error=True)
 
 
 # ─── Pipeline singleton ───────────────────────────────────────────────────────
+# FIX: replaced lru_cache with an explicit singleton pattern.
+# lru_cache does NOT cache exceptions — if get_chain() raises on the first call
+# (e.g. missing CSV), every subsequent request retries the full expensive setup.
+# This manual pattern caches the instance on success and re-raises clearly on failure.
 
-@lru_cache(maxsize=1)
+_chain_instance: InventoryRAGChain | None = None
+_chain_error:    Exception | None          = None
+
+
 def get_chain() -> InventoryRAGChain:
-    """Return the singleton RAG chain — built once, reused across all requests."""
+    """
+    Return the singleton RAG chain — built once, reused across all requests.
+    Raises RuntimeError with a clear message if the chain failed to initialise.
+    """
+    global _chain_instance, _chain_error
+
+    if _chain_instance is not None:
+        return _chain_instance
+
+    if _chain_error is not None:
+        raise RuntimeError(
+            f"Pipeline failed to initialise and will not retry: {_chain_error}"
+        ) from _chain_error
+
     api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is not set in .env")
-    return InventoryRAGChain(
-        api_key=api_key,
-        csv_path=CSV_PATH,
-        chroma_path=CHROMA_PATH,
-        db_path=DB_PATH,
-    )
+
+    try:
+        _chain_instance = InventoryRAGChain(
+            api_key=api_key,
+            csv_path=CSV_PATH,
+            chroma_path=CHROMA_PATH,
+            db_path=DB_PATH,
+        )
+        return _chain_instance
+    except Exception as exc:
+        _chain_error = exc
+        raise
 
 
 def get_db():

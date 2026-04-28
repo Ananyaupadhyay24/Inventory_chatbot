@@ -6,6 +6,16 @@ Calls the FastAPI backend at http://localhost:8000
 
 Run backend first : uvicorn backend.main:app --reload --port 8000
 Run frontend      : streamlit run app.py
+
+FIXES APPLIED
+-------------
+  BUG-11 : llm_history is capped at the last 20 messages before sending to
+           the backend, preventing payload bloat and LLM context overflow.
+  NEW    : Query Debug panel (admin only) shows: query type, entities,
+           SQL generated, rows returned, confidence, path taken.
+  NEW    : Stage status indicator during query execution.
+  NEW    : Audit Log tab (admin only) shows recent queries.
+  NEW    : Logout calls /auth/logout to invalidate the refresh token.
 """
 
 import os
@@ -18,14 +28,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+
 st.set_page_config(
     page_title="IT Admin — Inventory Assistant",
     page_icon="🖥️",
     layout="wide",
 )
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
-TIMEOUT  = 120   # seconds (LangGraph agent can take a moment)
+API_BASE           = os.getenv("API_BASE_URL", "http://localhost:8000")
+TIMEOUT            = 120
+MAX_HISTORY_ITEMS  = 20   # BUG-11 fix: cap history before sending
+
 
 # ─── Auth helpers ─────────────────────────────────────────────────────────────
 
@@ -35,7 +48,6 @@ def _auth_headers() -> dict:
 
 
 def do_login(username: str, password: str) -> bool:
-    """POST /auth/login → store tokens in session_state."""
     try:
         r = httpx.post(
             f"{API_BASE}/auth/login",
@@ -56,7 +68,6 @@ def do_login(username: str, password: str) -> bool:
 
 
 def try_refresh() -> bool:
-    """Exchange refresh token for a new access token silently."""
     rt = st.session_state.get("refresh_token", "")
     if not rt:
         return False
@@ -72,14 +83,22 @@ def try_refresh() -> bool:
     return False
 
 
+def do_logout():
+    """Call /auth/logout to revoke refresh token, then clear session."""
+    try:
+        httpx.post(f"{API_BASE}/auth/logout", headers=_auth_headers(), timeout=5)
+    except Exception:
+        pass
+    st.session_state.clear()
+
+
 def render_login_page():
-    """Full-page login form. Calls st.stop() until authenticated."""
     _, col, _ = st.columns([1, 1.2, 1])
     with col:
-        st.markdown("## IT Admin Login")
+        st.markdown("## 🖥️ IT Admin Login")
         st.markdown("---")
         with st.form("login_form"):
-            username  = st.text_input("Username", placeholder="admin")
+            username  = st.text_input("Username", placeholder="Enter username")
             password  = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Login", use_container_width=True)
         if submitted:
@@ -87,7 +106,6 @@ def render_login_page():
                 st.rerun()
             else:
                 st.error("Invalid username or password.")
-        st.caption("Default: **admin** / admin123   ·   **viewer** / viewer123")
     st.stop()
 
 
@@ -132,6 +150,7 @@ def api_post(path: str, body: dict) -> dict:
 
 
 # ─── Quick query groups ────────────────────────────────────────────────────────
+
 QUERY_GROUPS = {
     "Asset Lookup": [
         "What machine does Anjali Garg have?",
@@ -177,25 +196,26 @@ QUERY_GROUPS = {
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
+
 def render_sidebar(stats: dict):
     with st.sidebar:
-        # ── User info + logout ──
         username = st.session_state.get("username", "")
         role     = st.session_state.get("role", "viewer")
         st.markdown(f"**{username}** `{role}`")
+
+        # BUG-08 fix: logout calls /auth/logout to invalidate refresh token
         if st.button("Logout", use_container_width=True):
-            st.session_state.clear()
+            do_logout()
             st.rerun()
         st.divider()
 
         st.header("Live Dashboard")
-
         c1, c2 = st.columns(2)
-        c1.metric("Total Assets", stats.get("total",    0))
-        c2.metric("In Stock",     stats.get("in_stock", 0))
-        c1.metric("Laptops",      stats.get("laptops",  0))
-        c2.metric("Desktops",     stats.get("desktops", 0))
-        c1.metric("Faulty",       stats.get("faulty",   0))
+        c1.metric("Total Assets", stats.get("total",      0))
+        c2.metric("In Stock",     stats.get("in_stock",   0))
+        c1.metric("Laptops",      stats.get("laptops",    0))
+        c2.metric("Desktops",     stats.get("desktops",   0))
+        c1.metric("Faulty",       stats.get("faulty",     0))
         c2.metric("Win10",        stats.get("windows_10", 0))
 
         st.divider()
@@ -214,6 +234,8 @@ def render_sidebar(stats: dict):
         health = api_get("/health")
         if health.get("status") == "ok":
             st.success(f"API online · {health.get('chroma_indexed', 0)} vectors indexed")
+            if not health.get("rate_limiting"):
+                st.caption("⚠️ Rate limiting inactive (install slowapi)")
         else:
             st.error("API offline")
 
@@ -234,18 +256,44 @@ def render_sidebar(stats: dict):
 
 
 # ─── Tab 1: Chat ──────────────────────────────────────────────────────────────
+
 def render_chat_tab():
     st.subheader("Ask anything about your IT assets")
-    st.caption("LangGraph · SQL Agent · ChromaDB semantic fallback · GPT-4o-mini")
+    st.caption("LangGraph · SQL Agent · ChromaDB semantic fallback · Groq llama-3.3-70b")
+
+    role = st.session_state.get("role", "viewer")
+
+    # Admin-only: Query Debug toggle
+    show_debug = False
+    if role == "admin":
+        show_debug = st.toggle(
+            "🔍 Query Debug (admin)",
+            value=False,
+            help="Shows SQL generated, entities extracted, path taken, and confidence for each query.",
+        )
 
     if "messages"    not in st.session_state:
         st.session_state["messages"]    = []
     if "llm_history" not in st.session_state:
         st.session_state["llm_history"] = []
 
+    # Render message history
     for i, msg in enumerate(st.session_state["messages"]):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+
+            # Show debug info for assistant messages if debug is on
+            if show_debug and msg["role"] == "assistant" and msg.get("debug"):
+                dbg = msg["debug"]
+                with st.expander("🔍 Debug info", expanded=False):
+                    d1, d2, d3, d4 = st.columns(4)
+                    d1.markdown(f"**Query type**\n\n`{dbg.get('query_type', '—')}`")
+                    d2.markdown(f"**Confidence**\n\n`{dbg.get('confidence', '—')}`")
+                    d3.markdown(f"**Rows returned**\n\n`{dbg.get('count', 0)}`")
+                    d4.markdown(f"**Path**\n\n`{dbg.get('path', '—')}`")
+                    if dbg.get("sql"):
+                        st.code(dbg["sql"], language="sql")
+
             if "table" in msg and msg["table"]:
                 df = pd.DataFrame(msg["table"])
                 st.dataframe(df, use_container_width=True)
@@ -265,14 +313,48 @@ def render_chat_tab():
         with st.chat_message("user"):
             st.markdown(user_input)
         st.session_state["messages"].append({"role": "user", "content": user_input})
+        # BUG-11 fix: only keep last MAX_HISTORY_ITEMS entries in llm_history
         st.session_state["llm_history"].append({"role": "user", "content": user_input})
+        st.session_state["llm_history"] = st.session_state["llm_history"][-MAX_HISTORY_ITEMS:]
 
         with st.chat_message("assistant"):
-            with st.spinner("Running SQL agent..."):
-                resp = api_post("/chat", {
-                    "query":   user_input,
-                    "history": st.session_state["llm_history"],
-                })
+            # Stage status indicator — shows progress while the agent is running
+            status_placeholder = st.empty()
+            stages = [
+                "🔍 Classifying query...",
+                "🧩 Extracting entities...",
+                "✍️  Generating SQL...",
+                "⚙️  Executing query...",
+                "📝 Writing answer...",
+            ]
+
+            import time
+            import threading
+
+            stage_idx   = [0]
+            stop_flag   = [False]
+            status_text = status_placeholder.status(stages[0], expanded=False)
+
+            def cycle_stages():
+                i = 0
+                while not stop_flag[0]:
+                    status_placeholder.status(stages[i % len(stages)], expanded=False)
+                    time.sleep(1.8)
+                    i += 1
+
+            t = threading.Thread(target=cycle_stages, daemon=True)
+            t.start()
+
+            # BUG-11 fix: cap history sent to backend
+            history_to_send = st.session_state["llm_history"][-MAX_HISTORY_ITEMS:]
+
+            resp = api_post("/chat", {
+                "query":   user_input,
+                "history": history_to_send,
+            })
+
+            stop_flag[0] = True
+            status_placeholder.empty()
 
             answer  = resp.get("answer",  "No answer returned.")
             records = resp.get("records", [])
@@ -280,6 +362,26 @@ def render_chat_tab():
 
             st.markdown(answer)
             msg_idx = len(st.session_state["messages"])
+
+            debug_info = None
+            if show_debug and resp:
+                # The backend doesn't expose these fields yet in ChatResponse,
+                # but they are logged in audit_log. For now we surface what we have.
+                debug_info = {
+                    "count":      count,
+                    "query_type": resp.get("query_type", "—"),
+                    "confidence": resp.get("confidence", "—"),
+                    "sql":        resp.get("sql_generated", ""),
+                    "path":       resp.get("path_taken", "—"),
+                }
+                if any(v and v != "—" and v != "" for v in debug_info.values()):
+                    with st.expander("🔍 Debug info", expanded=True):
+                        d1, d2, d3 = st.columns(3)
+                        d1.markdown(f"**Confidence**\n\n`{debug_info.get('confidence', '—')}`")
+                        d2.markdown(f"**Rows returned**\n\n`{count}`")
+                        d3.markdown(f"**Path**\n\n`{debug_info.get('path', '—')}`")
+                        if debug_info.get("sql"):
+                            st.code(debug_info["sql"], language="sql")
 
             if records:
                 df = pd.DataFrame(records)
@@ -294,14 +396,17 @@ def render_chat_tab():
                 )
 
         st.session_state["messages"].append({
-            "role": "assistant", "content": answer, "table": records,
+            "role": "assistant",
+            "content": answer,
+            "table":   records,
+            "debug":   debug_info,
         })
-        st.session_state["llm_history"].append({
-            "role": "assistant", "content": answer,
-        })
+        st.session_state["llm_history"].append({"role": "assistant", "content": answer})
+        st.session_state["llm_history"] = st.session_state["llm_history"][-MAX_HISTORY_ITEMS:]
 
 
 # ─── Tab 2: Asset Release ─────────────────────────────────────────────────────
+
 def render_release_tab():
     st.subheader("Asset Release — Employee Exit")
     st.caption("Free all devices assigned to a departing employee and move them to IT Stock.")
@@ -368,11 +473,11 @@ def render_release_tab():
         st.info("No items currently in IT Stock.")
 
 
-# ─── Tab 3: Analytics ────────────────────────────────────────────────────────
+# ─── Tab 3: Analytics ─────────────────────────────────────────────────────────
+
 def render_analytics_tab():
     st.subheader("Analytics — Stock, Prediction & Procurement")
 
-    # ── A: Current Stock ──────────────────────────────────────────────────────
     with st.expander("Current Stock Visibility", expanded=True):
         st.caption("All unassigned devices in IT Stock, grouped by type and location.")
         with st.spinner("Loading..."):
@@ -391,23 +496,77 @@ def render_analytics_tab():
 
     st.divider()
 
-    # ── B: Prediction ─────────────────────────────────────────────────────────
     with st.expander("Future Requirement Prediction", expanded=True):
-        st.caption("Estimate device needs for upcoming hires based on current ratios.")
-        joiners = st.number_input("Expected new joiners", min_value=1, max_value=500,
-                                  value=10, step=1, key="pred_joiners")
+        st.caption(
+            "Estimate device needs for upcoming hires. "
+            "Filter by department and device category for an AI-reasoned forecast."
+        )
+
+        c1, c2, c3 = st.columns([1, 1.2, 1.5])
+
+        joiners = c1.number_input(
+            "Expected new joiners",
+            min_value=1, max_value=500, value=10, step=1,
+            key="pred_joiners",
+        )
+
+        department = c2.text_input(
+            "Department / Team  (optional)",
+            placeholder="e.g. Engineering, QA, Design",
+            key="pred_dept",
+            help="Matches against designation and office location. Leave blank for company-wide.",
+        )
+
+        categories = c3.multiselect(
+            "Device category  (optional)",
+            options=["Laptop", "Desktop", "MAC Mini"],
+            default=[],
+            key="pred_cats",
+            help="Leave blank to include all device types.",
+        )
+
         if st.button("Predict Requirements", key="btn_predict"):
-            with st.spinner("Calculating..."):
-                resp = api_post("/analytics/predict", {"new_joiners": int(joiners)})
+            with st.spinner("Calculating and generating AI insights…"):
+                resp = api_post("/analytics/smart-predict", {
+                    "new_joiners": int(joiners),
+                    "department":  department.strip(),
+                    "categories":  categories,
+                })
+
             if resp.get("breakdown"):
-                st.success(f"Device needs for **{joiners}** new joiners:")
-                st.dataframe(pd.DataFrame(resp["breakdown"]), use_container_width=True)
+                scope_label = resp.get("department", "All Departments")
+                cats_label  = ", ".join(resp.get("categories") or ["All"])
+                st.success(
+                    f"Device forecast for **{joiners}** new joiner(s) · "
+                    f"Dept: **{scope_label}** · Category: **{cats_label}**"
+                )
+
+                st.dataframe(
+                    pd.DataFrame(resp["breakdown"]),
+                    use_container_width=True,
+                )
+
+                # ── AI Reasoning ──────────────────────────────────────────────
+                st.markdown("#### 🤖 AI Analysis")
+
+                col_r, col_a = st.columns(2)
+
+                with col_r:
+                    st.markdown("**What's needed & why**")
+                    st.info(resp.get("reasoning", "—"))
+
+                with col_a:
+                    st.markdown("**Recommended advancements**")
+                    st.success(resp.get("advancements", "—"))
+
             else:
-                st.warning("Could not generate prediction.")
+                st.warning(
+                    "Could not generate a prediction for those filters. "
+                    "Try a broader department name or clear the category filter."
+                )
 
     st.divider()
 
-    # ── C: Gap Analysis ───────────────────────────────────────────────────────
     with st.expander("Stock vs Requirement Gap Analysis", expanded=True):
         st.caption("Compare current IT Stock against predicted requirements.")
         joiners_gap = st.number_input("Expected new joiners", min_value=1, max_value=500,
@@ -434,7 +593,6 @@ def render_analytics_tab():
 
     st.divider()
 
-    # ── D: Procurement Suggestions ────────────────────────────────────────────
     with st.expander("Procurement Suggestions", expanded=True):
         st.caption("Recommended models and quantities to procure based on the gap.")
         joiners_proc = st.number_input("Expected new joiners", min_value=1, max_value=500,
@@ -454,25 +612,100 @@ def render_analytics_tab():
                 st.warning("Could not generate suggestions.")
 
 
+# ─── Tab 4: Audit Log (admin only) ───────────────────────────────────────────
+
+def render_audit_tab():
+    st.subheader("Audit Log")
+    st.caption("Recent queries, SQL generated, and confidence levels (admin only).")
+
+    col1, col2 = st.columns([1, 4])
+    limit = col1.number_input("Entries to load", min_value=10, max_value=500, value=50, step=10)
+
+    if col2.button("Refresh", use_container_width=False):
+        st.session_state.pop("audit_data", None)
+
+    if "audit_data" not in st.session_state:
+        with st.spinner("Loading audit log..."):
+            resp = api_get(f"/admin/audit-log?limit={limit}")
+        st.session_state["audit_data"] = resp
+
+    resp = st.session_state.get("audit_data", {})
+
+    if not resp or not resp.get("entries"):
+        st.info("No audit log entries found.")
+        return
+
+    df = pd.DataFrame(resp["entries"])
+    st.caption(f"Showing {resp.get('count', 0)} entries")
+
+    # Summary metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Queries",    len(df))
+    m2.metric("High Confidence",  int((df["confidence"] == "high").sum())   if "confidence" in df.columns else "—")
+    m3.metric("Low Confidence",   int((df["confidence"] == "low").sum())    if "confidence" in df.columns else "—")
+    m4.metric("0-row Results",    int(df["row_count"].astype(int).eq(0).sum()) if "row_count" in df.columns else "—")
+
+    st.divider()
+
+    # Colour-code confidence
+    def highlight_confidence(row):
+        c = row.get("confidence", "")
+        if c == "high":
+            return ["background-color: #d4edda"] * len(row)
+        if c == "medium":
+            return ["background-color: #fff3cd"] * len(row)
+        if c == "low":
+            return ["background-color: #f8d7da"] * len(row)
+        return [""] * len(row)
+
+    display_cols = [
+        c for c in ["timestamp", "username", "user_role", "original_query",
+                     "query_type", "row_count", "confidence", "path_taken",
+                     "sql_generated", "answer_preview"]
+        if c in df.columns
+    ]
+    styled = df[display_cols].style.apply(highlight_confidence, axis=1)
+    st.dataframe(styled, use_container_width=True, height=500)
+
+    st.download_button(
+        "Download Audit Log CSV",
+        data=df[display_cols].to_csv(index=False).encode(),
+        file_name="audit_log.csv",
+        mime="text/csv",
+    )
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
-    st.title("IT Admin — Inventory Assistant")
-    st.caption("FastAPI · LangGraph · SQL Agent · ChromaDB · OpenAI GPT-4o-mini")
+    st.title("🖥️ IT Admin — Inventory Assistant")
+    st.caption("FastAPI · LangGraph · SQL Agent · ChromaDB · Groq llama-3.3-70b")
 
-    # ── Auth gate: show login page if not authenticated ──
     if not st.session_state.get("access_token"):
-        render_login_page()     # calls st.stop() — nothing below runs
+        render_login_page()
 
-    # Load stats from backend
     stats = api_get("/assets/stats") or {}
-
     render_sidebar(stats)
 
-    tab_chat, tab_release, tab_analytics = st.tabs([
-        "Chat",
-        "Asset Release (Employee Exit)",
-        "Analytics & Procurement",
-    ])
+    role = st.session_state.get("role", "viewer")
+
+    # Admins get the Audit Log tab; viewers don't
+    if role == "admin":
+        tab_chat, tab_release, tab_analytics, tab_audit = st.tabs([
+            "💬 Chat",
+            "📤 Asset Release (Employee Exit)",
+            "📊 Analytics & Procurement",
+            "📋 Audit Log",
+        ])
+        with tab_audit:
+            render_audit_tab()
+    else:
+        tab_chat, tab_release, tab_analytics = st.tabs([
+            "💬 Chat",
+            "📤 Asset Release (Employee Exit)",
+            "📊 Analytics & Procurement",
+        ])
+
     with tab_chat:
         render_chat_tab()
     with tab_release:
