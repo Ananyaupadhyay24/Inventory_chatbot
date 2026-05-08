@@ -63,12 +63,20 @@ class StockSummaryResponse(BaseModel):
 
 
 class SmartPredictionResponse(BaseModel):
-    new_joiners:  int
-    department:   str
-    categories:   list[str]
-    breakdown:    list[dict]
-    reasoning:    str        # LLM: what you need and why
-    advancements: str        # LLM: recommended future improvements
+    new_joiners:     int
+    department:      str
+    categories:      list[str]
+    breakdown:       list[dict]
+
+    # ── Computed from real data (no LLM) ──────────────────────────────
+    # Each entry: {type, required, available, usable_available, shortfall, surplus}
+    per_type_gaps:   list[dict]
+
+    # ── LLM-generated structured output ───────────────────────────────
+    analysis:        list[str]   # 3 bullet points: env/stock findings
+    recommendations: list[str]   # 3-4 actionable bullet points
+    future_outlook:  str         # 1-sentence 3-month projection
+    priority:        str         # "High" | "Medium" | "Low"
 
 
 class PredictionResponse(BaseModel):

@@ -38,26 +38,96 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # ─── LLM reasoning helper ─────────────────────────────────────────────────────
 
-def _generate_reasoning(client: OpenAI, request: SmartPredictionRequest, context: dict) -> tuple[str, str]:
+def _usable_stock_count(conn: sqlite3.Connection, device_type: str, min_ram_gb: int = 16) -> int:
     """
-    Call the LLM with full context to produce:
-      - reasoning   : what is needed and why
-      - advancements: recommended upgrades / future improvements
+    Count IT-Stock items of *device_type* whose RAM is >= min_ram_gb.
+    Falls back to 0 on any SQL/cast error (e.g. blank or non-numeric RAM values).
+    """
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM inventory
+            WHERE  LOWER(current_user) LIKE '%it stock%'
+              AND  LOWER(type) = LOWER(?)
+              AND  CAST(
+                     TRIM(REPLACE(REPLACE(REPLACE(ram,' GB',''),'GB',''),'gb',''))
+                   AS INTEGER) >= ?
+            """,
+            (device_type, min_ram_gb),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
 
-    Returns (reasoning, advancements) as plain text strings.
+
+def _generate_reasoning(
+    client:  OpenAI,
+    request: SmartPredictionRequest,
+    context: dict,
+    conn:    sqlite3.Connection,
+) -> tuple[list[dict], list[str], list[str], str, str]:
     """
+    1. Compute per-type gap figures entirely from real DB data (no LLM for numbers).
+    2. Ask the LLM for analysis bullet-points, actionable recommendations,
+       a 3-month outlook sentence, and priority level.
+
+    Returns:
+        per_type_gaps   — [{type, required, available, usable_available,
+                            shortfall, surplus}, …]
+        analysis        — list[str]   (3 concise bullet-point findings)
+        recommendations — list[str]   (3-4 actionable bullet points)
+        future_outlook  — str         (one-sentence 3-month projection)
+        priority        — "High" | "Medium" | "Low"
+    """
+    stock_map = context.get("stock_by_type", {})
+    breakdown = context.get("breakdown", [])
+
+    # ── 1. Compute per-type gaps from real data ────────────────────────────────
+    per_type_gaps: list[dict] = []
+    total_shortfall = 0
+
+    for row in breakdown:
+        t                = row["Type"]
+        required         = int(row["Predicted Need"])
+        available        = int(stock_map.get(t, 0))
+        usable_available = _usable_stock_count(conn, t, min_ram_gb=16)
+        shortfall        = max(0, required - available)
+        surplus          = max(0, available - required)
+        total_shortfall += shortfall
+
+        per_type_gaps.append({
+            "type":             t,
+            "required":         required,
+            "available":        available,
+            "usable_available": usable_available,
+            "shortfall":        shortfall,
+            "surplus":          surplus,
+        })
+
+    # ── 2. Derive priority from real numbers (no LLM bias) ────────────────────
+    if total_shortfall > 0:
+        priority = "High"
+    elif any(
+        g["available"] > 0 and (g["available"] - g["required"]) < max(1, g["required"] * 0.2)
+        for g in per_type_gaps
+    ):
+        priority = "Medium"
+    else:
+        priority = "Low"
+
+    # ── 3. Build rich prompt for LLM bullet-point generation ──────────────────
     dept_label = context.get("department", "all departments")
     cats_label = ", ".join(context.get("categories") or ["all device types"])
 
-    breakdown_text = "\n".join(
-        f"  - {row['Type']}: {row['Predicted Need']} unit(s)"
-        for row in context.get("breakdown", [])
-    ) or "  (no breakdown available)"
-
-    stock_text = "\n".join(
-        f"  - {t}: {c} in stock"
-        for t, c in context.get("stock_by_type", {}).items()
-    ) or "  (no stock data)"
+    gaps_text = "\n".join(
+        f"  - {g['type']}: "
+        f"need {g['required']} | "
+        f"total stock {g['available']} | "
+        f"usable (≥16GB) {g['usable_available']} | "
+        f"shortfall {g['shortfall']} | "
+        f"surplus {g['surplus']}"
+        for g in per_type_gaps
+    ) or "  (no gap data)"
 
     os_text = ", ".join(
         f"{r['os']} ({r['cnt']})" for r in context.get("os_breakdown", [])
@@ -70,59 +140,100 @@ def _generate_reasoning(client: OpenAI, request: SmartPredictionRequest, context
     top_models_text = "\n".join(
         f"  - {r['make']} {r['model']} ({r['cnt']} units)"
         for r in context.get("top_models", [])
-    ) or "  (no model data)"
+    ) or "  (none)"
 
-    prompt = f"""You are an experienced IT Asset Manager.
-The team is onboarding {request.new_joiners} new joiner(s).
+    prompt = f"""You are a senior IT Asset Manager producing a structured device forecast report.
 
 SCOPE
------
-Department / Team : {dept_label}
-Device categories : {cats_label}
+─────
+Department  : {dept_label}
+Categories  : {cats_label}
+New joiners : {request.new_joiners}
 
-PREDICTED DEVICE NEEDS (based on current assignment ratios)
------------------------------------------------------------
-{breakdown_text}
+STOCK vs REQUIREMENT GAP  (all numbers are exact — do NOT change them)
+────────────────────────────────────────────────────────────────────────
+{gaps_text}
 
-CURRENT IT STOCK
-----------------
-{stock_text}
-
-EXISTING ENVIRONMENT (assigned devices in scope)
--------------------------------------------------
+EXISTING ENVIRONMENT
+────────────────────
 OS distribution  : {os_text}
 RAM distribution : {ram_text}
 Top models in use:
 {top_models_text}
 
-─────────────────────────────────────────────────────────────────────
-Please respond with ONLY a valid JSON object — no markdown fences,
-no explanation outside the JSON. Use this exact structure:
+────────────────────────────────────────────────────────────────────────
+Return ONLY a valid JSON object — no markdown fences, no text outside it.
+Use this EXACT structure (each list item is a standalone bullet-point string):
 
 {{
-  "reasoning": "2-4 sentence paragraph explaining what devices are needed, any stock gaps, and what to prioritise for the {dept_label} team.",
-  "advancements": "2-4 sentence paragraph recommending practical hardware/software upgrades or policy improvements that would benefit this department in the next 1-2 years (e.g. RAM upgrades, OS migration, SSD standardisation, peripheral needs, MDM enhancements)."
+  "analysis": [
+    "Finding about stock sufficiency/shortfall with exact numbers from the data above",
+    "Finding about spec quality — how many usable (16GB+) vs total available",
+    "Finding about model/OS consistency or any compatibility concern"
+  ],
+  "recommendations": [
+    "Actionable step 1 — include quantities and specifics (e.g. 'Upgrade 4 devices from 8GB → 16GB')",
+    "Actionable step 2",
+    "Actionable step 3",
+    "Actionable step 4 (optional — only include if genuinely useful)"
+  ],
+  "future_outlook": "Single sentence: expected total requirement over next 3 months with a concrete number and brief trend note."
 }}
-─────────────────────────────────────────────────────────────────────"""
 
+Rules:
+• Every analysis/recommendation item must be one self-contained sentence (no sub-bullets).
+• Use the exact numbers from the gap table — do not invent figures.
+• recommendations must be concrete actions (verbs: Upgrade, Reallocate, Procure, Audit, Migrate).
+• Do NOT write paragraphs — every value must be a plain string with no newlines."""
+
+    # ── 4. Call LLM ───────────────────────────────────────────────────────────
     try:
-        resp = client.chat.completions.create(
+        llm_resp = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=600,
         )
-        raw = resp.choices[0].message.content.strip()
-        # Strip accidental markdown fences if the model adds them
-        raw = raw.strip("```json").strip("```").strip()
-        data = json.loads(raw)
-        return data.get("reasoning", ""), data.get("advancements", "")
+        raw = llm_resp.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+
+        # Robust extraction: find first { … last }
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end != -1:
+            raw = raw[start : end + 1]
+
+        data            = json.loads(raw)
+        analysis        = data.get("analysis", [])
+        recommendations = data.get("recommendations", [])
+        future_outlook  = str(data.get("future_outlook", ""))
+
+        # Coerce to list[str] in case LLM returns a single string
+        if not isinstance(analysis, list):
+            analysis = [str(analysis)]
+        if not isinstance(recommendations, list):
+            recommendations = [str(recommendations)]
+        # Drop null / empty items
+        analysis        = [s for s in analysis if s and str(s).strip()]
+        recommendations = [s for s in recommendations if s and str(s).strip()]
+
     except Exception as exc:
-        return (
-            f"Prediction calculated successfully. {request.new_joiners} new joiners "
-            f"in {dept_label} will need the devices listed above.",
-            f"(AI reasoning unavailable: {exc})",
+        # Safe deterministic fallback — use the real numbers we already computed
+        analysis = [
+            f"{request.new_joiners} device(s) required for incoming joiners.",
+            f"Total shortfall across all types: {total_shortfall} unit(s).",
+            "Review RAM and OS specs of available stock before assignment.",
+        ]
+        recommendations = [
+            "Check stock items against 16GB RAM requirement before allocation.",
+            "Prioritise Windows 11 devices for new joiners.",
+            f"(AI detail unavailable: {exc})",
+        ]
+        future_outlook = (
+            f"Based on current hiring rate, expect approximately "
+            f"{request.new_joiners * 3} device(s) needed over the next 3 months."
         )
+
+    return per_type_gaps, analysis, recommendations, future_outlook, priority
 
 
 # ─── Smart prediction (department + category aware) ───────────────────────────
@@ -157,15 +268,20 @@ def smart_predict(
             ),
         )
 
-    reasoning, advancements = _generate_reasoning(chain.client, body, context)
+    per_type_gaps, analysis, recommendations, future_outlook, priority = (
+        _generate_reasoning(chain.client, body, context, conn)
+    )
 
     return SmartPredictionResponse(
-        new_joiners  = body.new_joiners,
-        department   = body.department or "All Departments",
-        categories   = body.categories or ["All"],
-        breakdown    = breakdown_df.to_dict(orient="records"),
-        reasoning    = reasoning,
-        advancements = advancements,
+        new_joiners     = body.new_joiners,
+        department      = body.department or "All Departments",
+        categories      = body.categories or ["All"],
+        breakdown       = breakdown_df.to_dict(orient="records"),
+        per_type_gaps   = per_type_gaps,
+        analysis        = analysis,
+        recommendations = recommendations,
+        future_outlook  = future_outlook,
+        priority        = priority,
     )
 
 

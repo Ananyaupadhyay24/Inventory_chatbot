@@ -546,18 +546,83 @@ def render_analytics_tab():
                     use_container_width=True,
                 )
 
-                # ── AI Reasoning ──────────────────────────────────────────────
-                st.markdown("#### 🤖 AI Analysis")
+                st.divider()
 
-                col_r, col_a = st.columns(2)
+                # ── Per-type gap summary cards ────────────────────────────────
+                st.markdown("#### \U0001f4ca Requirement vs Stock")
+                per_type_gaps = resp.get("per_type_gaps", [])
 
-                with col_r:
-                    st.markdown("**What's needed & why**")
-                    st.info(resp.get("reasoning", "—"))
+                for gap in per_type_gaps:
+                    device_type      = gap.get("type", "Device")
+                    required         = int(gap.get("required",         0))
+                    available        = int(gap.get("available",        0))
+                    usable_available = int(gap.get("usable_available", available))
+                    shortfall        = int(gap.get("shortfall",        0))
+                    surplus          = int(gap.get("surplus",          0))
+
+                    st.markdown(f"**{device_type}**")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Required",           required)
+                    m2.metric("Total Available",    available)
+                    m3.metric("Usable (\u226516 GB)", usable_available)
+
+                    if shortfall > 0:
+                        m4.metric(
+                            "Gap",
+                            f"\u2212{shortfall}",
+                            delta=f"Shortfall of {shortfall}",
+                            delta_color="inverse",
+                        )
+                    else:
+                        m4.metric(
+                            "Gap",
+                            f"+{surplus}",
+                            delta=f"Surplus of {surplus}",
+                            delta_color="normal",
+                        )
+
+                st.divider()
+
+                # ── Priority badge ────────────────────────────────────────────
+                priority      = resp.get("priority", "Low")
+                priority_icon = {"High": "\U0001f534", "Medium": "\U0001f7e1", "Low": "\U0001f7e2"}.get(priority, "\u26aa")
+                priority_bg   = {"High": "#f8d7da", "Medium": "#fff3cd", "Low": "#d4edda"}.get(priority, "#f0f0f0")
+                st.markdown(
+                    f"<div style='padding:8px 14px;border-radius:6px;"
+                    f"background:{priority_bg};display:inline-block;"
+                    f"font-weight:600;margin-bottom:12px;'>"
+                    f"{priority_icon} Priority: {priority}</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # ── AI Analysis + Recommendations ─────────────────────────────
+                st.markdown("#### \U0001f916 AI Analysis")
+                col_a, col_r = st.columns(2)
 
                 with col_a:
-                    st.markdown("**Recommended advancements**")
-                    st.success(resp.get("advancements", "—"))
+                    st.markdown("**Analysis**")
+                    analysis_points = resp.get("analysis", [])
+                    if analysis_points:
+                        for point in analysis_points:
+                            st.markdown(f"- {point}")
+                    else:
+                        st.caption("No analysis available.")
+
+                with col_r:
+                    st.markdown("**Recommendations**")
+                    recs = resp.get("recommendations", [])
+                    if recs:
+                        for rec in recs:
+                            st.markdown(f"- {rec}")
+                    else:
+                        st.caption("No recommendations available.")
+
+                # ── Future Outlook ────────────────────────────────────────────
+                outlook = resp.get("future_outlook", "").strip()
+                if outlook:
+                    st.divider()
+                    st.markdown("**\U0001f52d Future Outlook**")
+                    st.info(f"- {outlook}")
 
             else:
                 st.warning(
