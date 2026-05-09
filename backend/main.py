@@ -63,11 +63,15 @@ app = FastAPI(
 # Allow Streamlit frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
+    allow_origins=[
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+        "http://localhost:3000",      # ← add this
+        "http://127.0.0.1:3000",      # ← add this
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ─── Routers ──────────────────────────────────────────────────────────────────
 
 app.include_router(auth_router.router)   # /auth/*  — public

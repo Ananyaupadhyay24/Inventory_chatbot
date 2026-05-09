@@ -1,7 +1,4 @@
-# Environment & secrets
-.env
-
-# Python
+# ─── Python / Backend ─────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -10,27 +7,55 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+*.egg
 .eggs/
+*.whl
 
 # Virtual environments
 venv/
-.venv/
 env/
+.venv/
+.env/
 
-# Data & generated files
+# Environment variables
+.env
+.env.local
+.env.production
+backend/.env
+
+# Database & vector store
 *.db
+*.sqlite
+*.sqlite3
+inventory.db
 chroma_db/
-master_inventory.csv
 
-# Streamlit cache
-.streamlit/
+# ─── Node / React Frontend ────────────────────────────────────────────────────
+node_modules/
+it-admin-react/node_modules/
+it-admin-react/build/
+it-admin-react/.env
+it-admin-react/.env.local
+package-lock.json
+it-admin-react/package-lock.json
+yarn.lock
 
-# IDE
+# ─── OS Files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Editor ───────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
-.DS_Store
-Thumbs.db
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+npm-debug.log*
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.csv
+master_inventory.csv
